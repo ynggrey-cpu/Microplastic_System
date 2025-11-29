@@ -1,444 +1,399 @@
-#!/usr/bin/env python3
-"""
-feature_selection_and_resampling.py
-
-Usage:
-- Edit the DATA_PATH variable or call load_data(df=your_dataframe).
-- The script expects a column named 'Risk_Type' as the target.
-- Installs required packages if missing: scikit-learn, pandas, numpy, imbalanced-learn, matplotlib, seaborn
-
-What it does:
-1. Loads preprocessed dataset (or accepts a DataFrame).
-2. Reports class distribution for 'Risk_Type'.
-3. Runs multiple feature selection methods:
-   - Filter: ANOVA f_classif and mutual_info_classif
-   - Filter (categorical): chi2 (requires non-negative; handled with MinMaxScaler)
-   - Embedded: L1 LogisticRegression (SelectFromModel), RandomForest feature importances (SelectFromModel)
-   - Wrapper: RFE with LogisticRegression
-4. Aggregates top features from each method and shows votes/ranks.
-5. Trains baseline models and evaluates F1-scores (macro/micro) with StratifiedKFold.
-6. Provides resampling helpers (SMOTE, SMOTENC, RandomOverSampler, RandomUnderSampler) and compares results.
-7. Runs GridSearchCV for basic hyperparameter tuning inside a pipeline (including sampling).
-"""
-
-import argparse
-import warnings
-from collections import Counter, defaultdict
-from typing import Optional, Tuple, List, Dict
-
-import numpy as np
+import streamlit as st
 import pandas as pd
-
-# sklearn
-from sklearn.model_selection import StratifiedKFold, cross_val_score, GridSearchCV, train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
-from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif, chi2, SelectFromModel, RFE
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, f1_score, confusion_matrix
-from sklearn.pipeline import Pipeline
-
-# visualization
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-# imbalanced-learn
-try:
-    from imblearn.over_sampling import RandomOverSampler, SMOTE, SMOTENC
-    from imblearn.under_sampling import RandomUnderSampler
-    from imblearn.pipeline import Pipeline as ImbPipeline
-except Exception as e:
-    raise ImportError(
-        "imblearn is required for resampling (pip install imbalanced-learn). Original error: {}".format(e)
-    )
+st.set_page_config(page_title="Microplastic Risk Dashboard", page_icon="🧪", layout="wide")
+st.title("🧪 Microplastic Risk Analysis — Enhanced Interactive Dashboard")
 
-warnings.filterwarnings("ignore")
-sns.set(style="whitegrid")
+# -----------------------------
+# Sidebar Navigation
+# -----------------------------
+st.sidebar.title("Navigation")
+tabs = [
+    "1. Upload & Preview",
+    "2. Data Preprocessing",
+    "3. Modeling & Performance",
+    "4. Visualizations"
+]
+selected_tab = st.sidebar.radio("Go to step:", tabs)
 
-# ---------- Configuration ----------
-DATA_PATH = "preprocessed_data.csv"  # change to your preprocessed csv path or pass a df to load_data()
-TARGET_COL = "Risk_Type"
-RANDOM_STATE = 42
-N_JOBS = -1
-TOP_K = 20  # top features to display from each method
-# -----------------------------------
+# Session state for data
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "preprocessed" not in st.session_state:
+    st.session_state.preprocessed = False
 
+num_cols = ["MP_Count_per_L", "Risk_Score", "Microplastic_Size_mm_midpoint", "Density_midpoint"]
+cat_cols = ["Location", "Shape", "Polymer_Type", "pH", "Salinity", "Industrial_Activity",
+            "Population_Density", "Risk_Type", "Risk_Level", "Author"]
 
-def load_data(path: Optional[str] = None, df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """
-    Load dataset from CSV or accept a DataFrame directly.
-    Ensures TARGET_COL exists.
-    """
-    if df is not None:
-        data = df.copy()
-    elif path is not None:
-        data = pd.read_csv(path)
-    else:
-        raise ValueError("Provide either path or df")
-
-    if TARGET_COL not in data.columns:
-        raise ValueError(f"Target column '{TARGET_COL}' not found in data. Columns: {data.columns.tolist()}")
-
-    return data
-
-
-def show_class_distribution(y: pd.Series, plot: bool = True) -> None:
-    counts = y.value_counts()
-    print("Class distribution (counts):")
-    print(counts)
-    print("\nClass distribution (percent):")
-    print((counts / counts.sum() * 100).round(2))
-
-    if plot:
-        plt.figure(figsize=(8, 4))
-        sns.barplot(x=counts.index.astype(str), y=counts.values)
-        plt.title("Risk_Type class distribution")
-        plt.ylabel("Count")
-        plt.xlabel("Risk_Type")
-        plt.show()
-
-
-def split_features_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    X = df.drop(columns=[TARGET_COL])
-    y = df[TARGET_COL].copy()
-    # encode target if needed
-    if y.dtype == object or y.dtype.name == "category":
-        le = LabelEncoder()
-        y = pd.Series(le.fit_transform(y), index=y.index, name=y.name)
-        # store mapping if you need
-        print("Target label mapping:", dict(zip(le.classes_, le.transform(le.classes_))))
-    return X, y
-
-
-def identify_column_types(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
-    print(f"Identified {len(num_cols)} numeric columns and {len(cat_cols)} categorical columns.")
-    return num_cols, cat_cols
-
-
-def run_filter_methods(X: pd.DataFrame, y: pd.Series, num_cols: List[str], cat_cols: List[str], top_k: int = TOP_K) -> Dict[str, List[Tuple[str, float]]]:
-    results = {}
-
-    if len(num_cols) > 0:
-        # ANOVA f_classif (numerical inputs)
-        skb_f = SelectKBest(score_func=f_classif, k=min(top_k, len(num_cols)))
-        skb_f.fit(X[num_cols], y)
-        scores_f = sorted(zip(num_cols, skb_f.scores_), key=lambda x: -np.nan_to_num(x[1]))
-        results['f_classif'] = scores_f[:top_k]
-
-        # mutual_info_classif
-        skb_mi = SelectKBest(score_func=mutual_info_classif, k=min(top_k, len(num_cols)))
-        skb_mi.fit(X[num_cols], y)
-        scores_mi = sorted(zip(num_cols, skb_mi.scores_), key=lambda x: -np.nan_to_num(x[1]))
-        results['mutual_info'] = scores_mi[:top_k]
-    else:
-        results['f_classif'] = []
-        results['mutual_info'] = []
-
-    if len(cat_cols) > 0:
-        # chi2 requires non-negative data, we'll MinMax scale categorical encoded as integers or one-hot
-        # Try label-encoding categories into integer codes (works if they are ordinal-ish)
-        X_cat_encoded = X[cat_cols].apply(lambda col: col.astype('category').cat.codes)
-        scaler = MinMaxScaler()
-        X_cat_scaled = scaler.fit_transform(X_cat_encoded.fillna(0))
-        skb_chi = SelectKBest(score_func=chi2, k=min(top_k, len(cat_cols)))
-        skb_chi.fit(X_cat_scaled, y)
-        scores_chi = sorted(zip(cat_cols, skb_chi.scores_), key=lambda x: -np.nan_to_num(x[1]))
-        results['chi2_categorical'] = scores_chi[:top_k]
-    else:
-        results['chi2_categorical'] = []
-
-    return results
-
-
-def run_embedded_methods(X: pd.DataFrame, y: pd.Series, top_k: int = TOP_K) -> Dict[str, List[Tuple[str, float]]]:
-    results = {}
-
-    # L1 Logistic Regression (sparse) - good for linear relationships
-    try:
-        lr = LogisticRegression(penalty='l1', solver='saga', max_iter=5000, random_state=RANDOM_STATE, class_weight='balanced')
-        sfm_lr = SelectFromModel(lr, max_features=top_k)
-        sfm_lr.fit(X.fillna(0), y)
-        # coefficients absolute value
-        if hasattr(sfm_lr.estimator_, 'coef_'):
-            coefs = np.abs(sfm_lr.estimator_.coef_).mean(axis=0)
-            feature_names = X.columns[sfm_lr.estimator_.coef_.shape[1] - len(coefs):] if False else X.columns
-            scores = sorted(zip(X.columns, coefs), key=lambda x: -x[1])
-            results['l1_logistic'] = scores[:top_k]
-        else:
-            # fallback to selected features only
-            sel = X.columns[sfm_lr.get_support()]
-            results['l1_logistic'] = [(f, 1.0) for f in sel[:top_k]]
-    except Exception as e:
-        print("L1 logistic failed:", e)
-        results['l1_logistic'] = []
-
-    # RandomForest feature importances
-    try:
-        rf = RandomForestClassifier(n_estimators=500, random_state=RANDOM_STATE, n_jobs=N_JOBS, class_weight='balanced')
-        rf.fit(X.fillna(0), y)
-        importances = rf.feature_importances_
-        scores_rf = sorted(zip(X.columns, importances), key=lambda x: -x[1])
-        results['random_forest'] = scores_rf[:top_k]
-    except Exception as e:
-        print("RandomForest embedded method failed:", e)
-        results['random_forest'] = []
-
-    return results
-
-
-def run_wrapper_methods(X: pd.DataFrame, y: pd.Series, top_k: int = TOP_K) -> Dict[str, List[Tuple[str, float]]]:
-    results = {}
-    # RFE with logistic regression
-    try:
-        lr = LogisticRegression(penalty='l2', solver='liblinear', max_iter=2000, random_state=RANDOM_STATE, class_weight='balanced')
-        n_features_to_select = min(top_k, X.shape[1])
-        rfe = RFE(estimator=lr, n_features_to_select=n_features_to_select, step=0.1)
-        rfe.fit(X.fillna(0), y)
-        ranking = list(zip(X.columns, rfe.ranking_))
-        # ranking 1 means selected
-        selected = [(name, 1.0) for name, rank in ranking if rank == 1]
-        # for ordering present features by importance if estimator has coef_
-        if hasattr(rfe.estimator_, 'coef_'):
-            coefs = np.abs(rfe.estimator_.coef_).mean(axis=0)
-            scores = sorted(zip(X.columns, coefs), key=lambda x: -x[1])
-            results['rfe_logistic'] = scores[:top_k]
-        else:
-            results['rfe_logistic'] = selected[:top_k]
-    except Exception as e:
-        print("RFE failed:", e)
-        results['rfe_logistic'] = []
-
-    return results
-
-
-def aggregate_feature_rankings(method_results: Dict[str, Dict]) -> pd.DataFrame:
-    """
-    Aggregate rankings from multiple methods into a single DataFrame with votes and average rank.
-    method_results: mapping method_name -> list of (feature, score)
-    """
-    votes = defaultdict(lambda: [])
-    for method, items in method_results.items():
-        for rank, (feat, score) in enumerate(items, start=1):
-            votes[feat].append(rank)
-
-    agg = []
-    for feat, ranks in votes.items():
-        agg.append({
-            'feature': feat,
-            'votes': len(ranks),
-            'avg_rank': np.mean(ranks)
-        })
-    df_agg = pd.DataFrame(agg).sort_values(['votes', 'avg_rank'], ascending=[False, True])
-    return df_agg
-
-
-def evaluate_models(X: pd.DataFrame, y: pd.Series, feature_subset: Optional[List[str]] = None, cv_splits: int = 5) -> Dict[str, float]:
-    """
-    Train and evaluate LogisticRegression and RandomForest using StratifiedKFold CV, report macro/micro F1.
-    Returns summary dict.
-    """
-    results = {}
-    X_use = X[feature_subset] if feature_subset is not None else X
-    skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
-
-    models = {
-        'LogisticRegression': LogisticRegression(max_iter=5000, solver='saga', class_weight='balanced', random_state=RANDOM_STATE),
-        'RandomForest': RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE, n_jobs=N_JOBS, class_weight='balanced')
-    }
-
-    for name, model in models.items():
-        f1_macro = cross_val_score(model, X_use.fillna(0), y, scoring='f1_macro', cv=skf, n_jobs=N_JOBS).mean()
-        f1_micro = cross_val_score(model, X_use.fillna(0), y, scoring='f1_micro', cv=skf, n_jobs=N_JOBS).mean()
-        results[name] = {'f1_macro': float(f1_macro), 'f1_micro': float(f1_micro)}
-        print(f"{name}: f1_macro={f1_macro:.4f}, f1_micro={f1_micro:.4f}")
-    return results
-
-
-def resample_data(X: pd.DataFrame, y: pd.Series, method: str = 'none', categorical_features: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    Resample X,y using method:
-      - 'none' : no resampling
-      - 'oversample' : RandomOverSampler
-      - 'undersample' : RandomUnderSampler
-      - 'smote' : SMOTE (numeric only)
-      - 'smotenc' : SMOTENC (for datasets with categorical_features indices)
-    categorical_features: list of column names which are categorical (required for smotenc)
-    """
-    if method == 'none':
-        return X, y
-
-    if method == 'oversample':
-        ros = RandomOverSampler(random_state=RANDOM_STATE)
-        X_res, y_res = ros.fit_resample(X, y)
-        return pd.DataFrame(X_res, columns=X.columns), pd.Series(y_res, name=y.name)
-
-    if method == 'undersample':
-        rus = RandomUnderSampler(random_state=RANDOM_STATE)
-        X_res, y_res = rus.fit_resample(X, y)
-        return pd.DataFrame(X_res, columns=X.columns), pd.Series(y_res, name=y.name)
-
-    if method == 'smote':
-        sm = SMOTE(random_state=RANDOM_STATE)
-        X_res, y_res = sm.fit_resample(X.select_dtypes(include=[np.number]), y)
-        # combine numeric resampled with categorical repeated rows if any
-        # If dataset has categorical columns we need SMOTENC; here we'll just return numeric-only resampled
-        return pd.DataFrame(X_res, columns=X.select_dtypes(include=[np.number]).columns), pd.Series(y_res, name=y.name)
-
-    if method == 'smotenc':
-        if not categorical_features:
-            raise ValueError("categorical_features must be provided for smotenc")
-        cat_idx = [list(X.columns).index(c) for c in categorical_features]
-        smnc = SMOTENC(categorical_features=cat_idx, random_state=RANDOM_STATE)
-        X_res, y_res = smnc.fit_resample(X.fillna(0), y)
-        return pd.DataFrame(X_res, columns=X.columns), pd.Series(y_res, name=y.name)
-
-    raise ValueError("Unknown resampling method: " + method)
-
-
-def tune_model_with_resampling(X: pd.DataFrame, y: pd.Series, sampler: Optional[str] = None, categorical_features: Optional[List[str]] = None) -> Tuple[GridSearchCV, Dict]:
-    """
-    Create a pipeline (optional sampler -> scaler -> classifier) and run GridSearchCV for RandomForest and LogisticRegression.
-    sampler: 'none', 'oversample', 'smote', 'smotenc'
-    Returns fitted gridsearch (for last estimator) and best_params summary.
-    """
-    # Example grid for RandomForest
-    if sampler and sampler != 'none':
-        if sampler == 'oversample':
-            sampler_obj = RandomOverSampler(random_state=RANDOM_STATE)
-        elif sampler == 'smote':
-            sampler_obj = SMOTE(random_state=RANDOM_STATE)
-        elif sampler == 'smotenc':
-            if not categorical_features:
-                raise ValueError("Pass categorical_features for smotenc")
-            cat_idx = [list(X.columns).index(c) for c in categorical_features]
-            sampler_obj = SMOTENC(categorical_features=cat_idx, random_state=RANDOM_STATE)
-        else:
-            sampler_obj = None
-    else:
-        sampler_obj = None
-
-    pipe_steps = []
-    if sampler_obj is not None:
-        pipe_steps.append(('sampler', sampler_obj))
-    pipe_steps.append(('scaler', StandardScaler()))
-    pipe_steps.append(('clf', RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=N_JOBS)))
-
-    pipeline = ImbPipeline(pipe_steps)
-
-    param_grid = {
-        'clf__n_estimators': [100, 300],
-        'clf__max_depth': [None, 10, 30],
-        'clf__class_weight': [None, 'balanced']
-    }
-
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    gs = GridSearchCV(pipeline, param_grid, scoring='f1_macro', cv=skf, n_jobs=N_JOBS, verbose=1)
-    gs.fit(X.fillna(0), y)
-    print("Best params:", gs.best_params_)
-    print("Best score (f1_macro):", gs.best_score_)
-    return gs, {'best_params': gs.best_params_, 'best_score': float(gs.best_score_)}
-
-
-def demo_flow(path: Optional[str] = None, df: Optional[pd.DataFrame] = None):
-    # Load
-    data = load_data(path, df)
-    X, y = split_features_target(data)
-    show_class_distribution(y)
-
-    num_cols, cat_cols = identify_column_types(X)
-
-    print("\nRunning filter methods...")
-    filter_results = run_filter_methods(X, y, num_cols, cat_cols, top_k=TOP_K)
-    for k, v in filter_results.items():
-        print(f"\nTop results for {k}:")
-        for feat, score in v[:10]:
-            print(f"  {feat}: {score:.6f}")
-
-    print("\nRunning embedded methods...")
-    embedded_results = run_embedded_methods(X, y, top_k=TOP_K)
-    for k, v in embedded_results.items():
-        print(f"\nTop results for {k}:")
-        for feat, score in v[:10]:
-            print(f"  {feat}: {score:.6f}")
-
-    print("\nRunning wrapper methods (RFE)...")
-    wrapper_results = run_wrapper_methods(X, y, top_k=TOP_K)
-    for k, v in wrapper_results.items():
-        print(f"\nTop results for {k}:")
-        for feat, score in v[:10]:
-            print(f"  {feat}: {score:.6f}")
-
-    # Aggregate feature rankings
-    method_results_combined = {**filter_results, **embedded_results, **wrapper_results}
-    agg = aggregate_feature_rankings(method_results_combined)
-    print("\nAggregated feature ranking (top 30):")
-    print(agg.head(30))
-
-    # Use top N aggregated features to evaluate models
-    top_features = agg['feature'].head(30).tolist()
-    print("\nEvaluating models using top aggregated features:")
-    eval_results_top = evaluate_models(X, y, feature_subset=top_features, cv_splits=5)
-
-    print("\nEvaluate baseline models on all features:")
-    eval_results_all = evaluate_models(X, y, feature_subset=None, cv_splits=5)
-
-    # Investigate class imbalance and resampling
-    print("\nComparing resampling strategies (oversample, undersample, smote, smotenc if categorical available):")
-    resample_methods = ['none', 'oversample', 'undersample']
-    if len(num_cols) > 0:
-        resample_methods.append('smote')
-    if len(cat_cols) > 0:
-        resample_methods.append('smotenc')
-
-    resample_summary = {}
-    for method in resample_methods:
-        print(f"\nResampling method: {method}")
+# -----------------------------
+# 1. Upload & Preview
+# -----------------------------
+if selected_tab == tabs[0]:
+    st.header("Step 1: Upload Your Dataset")
+    uploaded_file = st.file_uploader("Upload CSV or Excel Dataset", type=["csv", "xlsx"])
+    if uploaded_file:
         try:
-            X_res, y_res = resample_data(X, y, method=method, categorical_features=cat_cols if method == 'smotenc' else None)
-            print(f"After resampling distribution: {Counter(y_res)}")
-            # Evaluate on resampled data using top_features intersection (ensure features exist)
-            features_to_use = [f for f in top_features if f in X_res.columns]
-            print("Features used:", len(features_to_use))
-            res_eval = evaluate_models(X_res, y_res, feature_subset=features_to_use if features_to_use else None, cv_splits=5)
-            resample_summary[method] = res_eval
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file, encoding='latin1')
+            else:
+                df = pd.read_excel(uploaded_file)
+            st.session_state.df = df
+            st.success("✅ Dataset uploaded successfully! Preview below:")
+            st.subheader("Dataset Preview (First 10 Rows)")
+            st.dataframe(df.head(10), use_container_width=True)
+            st.markdown("""
+            <details>
+            <summary style='font-weight:bold'>Show full uploaded dataset</summary>
+            """, unsafe_allow_html=True)
+            st.dataframe(df, use_container_width=True)
+            st.markdown("</details>", unsafe_allow_html=True)
+            st.info("Proceed to Data Preprocessing for cleaning and transformation.")
         except Exception as e:
-            print("Resampling failed for method", method, "error:", e)
+            st.error(f"Failed to read file: {e}")
+            st.stop()
+    elif st.session_state.df is not None:
+        st.success("Dataset previously uploaded.")
+        st.subheader("Dataset Preview (First 10 Rows)")
+        st.dataframe(st.session_state.df.head(10), use_container_width=True)
+        st.markdown("""
+        <details>
+        <summary style='font-weight:bold'>Show full uploaded dataset</summary>
+        """, unsafe_allow_html=True)
+        st.dataframe(st.session_state.df, use_container_width=True)
+        st.markdown("</details>", unsafe_allow_html=True)
+        st.info("You may continue to Data Preprocessing.")
 
-    # Example hyperparameter tuning with resampling in pipeline
-    print("\nRunning GridSearchCV with RandomOverSampler + RandomForest (this may take a while)...")
-    try:
-        gs, gs_summary = tune_model_with_resampling(X[top_features], y, sampler='oversample', categorical_features=cat_cols)
-    except Exception as e:
-        print("GridSearchCV failed:", e)
-        gs_summary = {}
+# -----------------------------
+# 2. Data Preprocessing
+# -----------------------------
+elif selected_tab == tabs[1]:
+    st.header("Step 2: Data Preprocessing")
+    df = st.session_state.df
+    if df is None:
+        st.warning("⚠️ Please upload a dataset in Step 1 first.")
+        st.stop()
 
-    print("\nDone. Summaries:")
-    print("Evaluation with top features:", eval_results_top)
-    print("Evaluation with all features:", eval_results_all)
-    print("Resampling summary:", resample_summary)
-    print("GridSearch summary:", gs_summary)
+    df_prep = df.copy()
+    # Outlier handling & skewness
+    outlier_report = []
+    for col in num_cols:
+        if col in df_prep.columns:
+            orig_stats = df_prep[col].describe()
+            df_prep[col] = pd.to_numeric(df_prep[col], errors='coerce')
+            nan_count = df_prep[col].isna().sum()
+            if df_prep[col].notna().sum() > 0:
+                Q1 = df_prep[col].quantile(0.25)
+                Q3 = df_prep[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower = Q1 - 1.5 * IQR
+                upper = Q3 + 1.5 * IQR
+                num_clipped = ((df_prep[col] < lower) | (df_prep[col] > upper)).sum()
+                df_prep[col] = np.clip(df_prep[col], lower, upper)
+                outlier_report.append(f"- **{col}**: {num_clipped} outliers clipped. {nan_count} NaNs.")
+            skew = df_prep[col].skew()
+            if df_prep[col].notna().sum() > 0 and skew > 1:
+                safe_log = df_prep[col] > -1
+                df_prep.loc[safe_log, col] = np.log1p(df_prep.loc[safe_log, col])
+                outlier_report.append(f"- **{col}**: Log transformation applied (skew={skew:.2f}).")
+    # Encoding
+    for col in cat_cols:
+        if col in df_prep.columns:
+            df_prep[col] = LabelEncoder().fit_transform(df_prep[col].astype(str))
+    # Scaling
+    scaler = StandardScaler()
+    for col in num_cols:
+        if col in df_prep.columns and df_prep[col].notna().sum() > 0:
+            df_prep[col] = scaler.fit_transform(df_prep[[col]])
 
-    # Optionally save top features to CSV
-    agg.to_csv("feature_ranking_aggregated.csv", index=False)
-    print("\nAggregated feature ranking saved to feature_ranking_aggregated.csv")
+    st.session_state.df = df_prep
+    st.session_state.preprocessed = True
 
-    # Return important objects if programmatic access desired
-    return {
-        'agg': agg,
-        'filter_results': filter_results,
-        'embedded_results': embedded_results,
-        'wrapper_results': wrapper_results,
-        'eval_top': eval_results_top,
-        'eval_all': eval_results_all,
-        'resample_summary': resample_summary,
-        'gridsearch_summary': gs_summary
+    st.success("✅ Data preprocessing complete!")
+    st.subheader("Preprocessed Dataset (First 10 Rows)")
+    st.dataframe(df_prep.head(10), use_container_width=True)
+    st.markdown("""
+    <details>
+    <summary style='font-weight:bold'>Show full preprocessed dataset</summary>
+    """, unsafe_allow_html=True)
+    st.dataframe(df_prep, use_container_width=True)
+    st.markdown("</details>", unsafe_allow_html=True)
+
+    with st.expander("Preprocessing Details & Report", expanded=False):
+        st.markdown("**Outlier & Skewness Report:**")
+        for report in outlier_report:
+            st.markdown(report)
+        st.markdown("""
+        - **Categorical Encoding:** All categorical columns transformed with LabelEncoder.
+        - **Scaling:** All numerical columns standardized using StandardScaler.
+        """)
+
+    with st.expander("Compare basic statistics before and after preprocessing", expanded=False):
+        num_cols_present = [col for col in num_cols if col in df.columns]
+        st.write("Original statistics (first numeric columns):")
+        if num_cols_present:
+            st.dataframe(df[num_cols_present].describe().T)
+        else:
+            st.warning("No valid numeric columns found for statistics in the uploaded dataset.")
+        num_cols_prep_present = [col for col in num_cols if col in df_prep.columns]
+        st.write("After preprocessing:")
+        if num_cols_prep_present:
+            st.dataframe(df_prep[num_cols_prep_present].describe().T)
+        else:
+            st.warning("No valid numeric columns found for statistics in the preprocessed dataset.")
+
+# -----------------------------
+# 3. Modeling & Performance (includes visualizations below)
+# -----------------------------
+elif selected_tab == tabs[2]:
+    st.header("Step 3: Modeling & Performance")
+    df = st.session_state.df
+    if df is None or st.session_state.preprocessed is False:
+        st.warning("⚠️ Please preprocess the data first.")
+        st.stop()
+    if "Risk_Type" not in df.columns or "Risk_Level" not in df.columns:
+        st.warning("⚠️ Required columns for modeling not found in data.")
+        st.stop()
+
+    X = df.drop(columns=["Risk_Type", "Risk_Level"], errors="ignore")
+    y_type = df['Risk_Type']
+    y_level = df['Risk_Level']
+    X = X.select_dtypes(include=[np.number])
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.fillna(0)
+    y_type = y_type.fillna(0)
+    y_level = y_level.fillna(0)
+
+    model_names = ["Logistic Regression", "Random Forest", "Gradient Boosting"]
+    model_objs = {
+        "Logistic Regression": LogisticRegression(max_iter=2000),
+        "Random Forest": RandomForestClassifier(),
+        "Gradient Boosting": GradientBoostingClassifier()
     }
 
+    st.sidebar.subheader("Model Selection")
+    selected_model = st.sidebar.selectbox("Choose a model to evaluate:", model_names)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Feature selection, class imbalance investigation, resampling, and basic tuning for Risk_Type")
-    parser.add_argument("--path", type=str, default=DATA_PATH, help="Path to preprocessed CSV file (must contain 'Risk_Type')")
-    args = parser.parse_args()
-    demo_flow(path=args.path)
+    st.subheader(f"Performance for {selected_model}")
+
+    X_train, X_test, y_train_type, y_test_type = train_test_split(X, y_type, test_size=0.2, random_state=42)
+    _, _, y_train_level, y_test_level = train_test_split(X, y_level, test_size=0.2, random_state=42)
+    model = model_objs[selected_model]
+
+    # Risk Type
+    model.fit(X_train, y_train_type)
+    preds_type = model.predict(X_test)
+    perf_type = {
+        "Accuracy": accuracy_score(y_test_type, preds_type),
+        "Precision": precision_score(y_test_type, preds_type, average='weighted', zero_division=0),
+        "Recall": recall_score(y_test_type, preds_type, average='weighted', zero_division=0),
+        "F1-Score": f1_score(y_test_type, preds_type, average='weighted', zero_division=0)
+    }
+    st.write("Risk Type Classification Metrics")
+    st.dataframe(pd.DataFrame(perf_type, index=[selected_model]).T, use_container_width=True)
+    st.info("""
+    **Interpretation:**  
+    These metrics indicate how well the selected model predicts Risk_Type categories.
+    Precision and recall are especially important for imbalanced classes.
+    """)
+
+    # Risk Level
+    model.fit(X_train, y_train_level)
+    preds_level = model.predict(X_test)
+    perf_level = {
+        "Accuracy": accuracy_score(y_test_level, preds_level),
+        "Precision": precision_score(y_test_level, preds_level, average='weighted', zero_division=0),
+        "Recall": recall_score(y_test_level, preds_level, average='weighted', zero_division=0),
+        "F1-Score": f1_score(y_test_level, preds_level, average='weighted', zero_division=0)
+    }
+    st.write("Risk Level Classification Metrics")
+    st.dataframe(pd.DataFrame(perf_level, index=[selected_model]).T, use_container_width=True)
+    st.info("""
+    **Interpretation:**  
+    These scores reflect the ability of your model to classify Risk Level groups.
+    High F1-score signals balanced accuracy and precision.
+    """)
+
+    # K-Fold Cross Validation
+    st.subheader("K-Fold Cross Validation Accuracy (Risk Type)")
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    cv_scores = cross_val_score(model, X, y_type, cv=kf, scoring='accuracy')
+    st.bar_chart(cv_scores)
+    st.info("""
+    **Interpretation:**  
+    The bar chart displays cross-validation fold accuracies.
+    Consistent scores across folds mean your model generalizes reliably.
+    Large differences may indicate sensitivity to dataset splits.
+    """)
+
+    # Model Metric Comparison (All Models)
+    st.subheader("Model Metric Comparison (Risk Type)")
+    metrics_dict = {}
+    for name, mod in model_objs.items():
+        mod.fit(X_train, y_train_type)
+        pred = mod.predict(X_test)
+        metrics_dict[name] = [
+            accuracy_score(y_test_type, pred),
+            precision_score(y_test_type, pred, average='weighted', zero_division=0),
+            recall_score(y_test_type, pred, average='weighted', zero_division=0),
+            f1_score(y_test_type, pred, average='weighted', zero_division=0)
+        ]
+    perf_df = pd.DataFrame(metrics_dict, index=["Accuracy","Precision","Recall","F1-Score"])
+    fig, ax = plt.subplots()
+    perf_df.plot(kind='bar', ax=ax)
+    st.pyplot(fig)
+    st.info("""
+    **Interpretation:**  
+    This bar chart visually compares model performance across key metrics for Risk Type classification. 
+    Use it to select the best performing model for further analysis or deployment.
+    """)
+
+    # -----------------------------
+    # Visualizations BELOW modeling
+    # -----------------------------
+    st.header("Step 4: Visualizations & Data Interpretations")
+    vis_options = [
+        "Risk Score Distribution",
+        "Risk Score vs MP_Count_per_L",
+        "Risk Score by Risk Level"
+    ]
+    selected_vis = st.sidebar.selectbox("Choose a visualization:", vis_options, index=0)
+
+    if selected_vis == vis_options[0]:
+        st.subheader("Risk Score Distribution")
+        if 'Risk_Score' in df.columns and df['Risk_Score'].notna().sum() > 0:
+            fig, ax = plt.subplots()
+            sns.histplot(df['Risk_Score'].dropna(), kde=True, ax=ax)
+            st.pyplot(fig)
+            st.info("""
+            **Interpretation:**  
+            The histogram shows the distribution of overall risk scores assigned to the water samples. 
+            Peaks in this graph indicate the most common risk levels present in the dataset after preprocessing. 
+            A right-skewed plot would suggest many samples have low risk, while a more uniform or left-skewed shape would suggest higher risk is more prevalent.
+            """)
+        else:
+            st.warning("Risk_Score column not found or empty.")
+
+    elif selected_vis == vis_options[1]:
+        st.subheader("Risk Score vs MP Count per Liter")
+        if (
+            'Risk_Score' in df.columns
+            and 'MP_Count_per_L' in df.columns
+            and df['Risk_Score'].notna().sum() > 0
+            and df['MP_Count_per_L'].notna().sum() > 0
+        ):
+            fig, ax = plt.subplots()
+            ax.scatter(df['Risk_Score'], df['MP_Count_per_L'])
+            ax.set_xlabel("Risk Score")
+            ax.set_ylabel("MP Count per L")
+            st.pyplot(fig)
+            st.info("""
+            **Interpretation:**  
+            This scatter plot relates microplastic count per liter to the assigned risk score.
+            A positive correlation suggests that areas with higher microplastic concentrations tend to have higher calculated risk scores.
+            Outliers may represent samples where risk assessment doesn't strictly follow microplastic levels, possibly due to other environmental factors.
+            """)
+        else:
+            st.warning("Required columns not found or empty.")
+
+    elif selected_vis == vis_options[2]:
+        st.subheader("Risk Score by Risk Level")
+        if (
+            'Risk_Level' in df.columns
+            and 'Risk_Score' in df.columns
+            and df['Risk_Score'].notna().sum() > 0
+        ):
+            fig, ax = plt.subplots()
+            sns.boxplot(x=df['Risk_Level'], y=df['Risk_Score'], ax=ax)
+            st.pyplot(fig)
+            st.info("""
+            **Interpretation:**  
+            This boxplot visualizes how risk scores vary across different categorical risk levels.
+            It showcases the central tendency (median) and spread for each risk group.
+            If there is good separation between levels, it means the risk scoring system discriminates well between categories.
+            Overlaps or outliers may suggest inconsistencies or areas needing further analysis.
+            """)
+        else:
+            st.warning("Required columns not found or empty.")
+
+# -----------------------------
+# 4. Visualizations (standalone tab)
+# -----------------------------
+elif selected_tab == tabs[3]:
+    st.header("Step 4: Visualizations & Data Interpretations")
+    df = st.session_state.df
+    if df is None or st.session_state.preprocessed is False:
+        st.warning("⚠️ Please preprocess the data first.")
+        st.stop()
+
+    vis_options = [
+        "Risk Score Distribution",
+        "Risk Score vs MP_Count_per_L",
+        "Risk Score by Risk Level"
+    ]
+    selected_vis = st.sidebar.selectbox("Choose a visualization:", vis_options, index=0)
+
+    if selected_vis == vis_options[0]:
+        st.subheader("Risk Score Distribution")
+        if 'Risk_Score' in df.columns and df['Risk_Score'].notna().sum() > 0:
+            fig, ax = plt.subplots()
+            sns.histplot(df['Risk_Score'].dropna(), kde=True, ax=ax)
+            st.pyplot(fig)
+            st.info("""
+            **Interpretation:**  
+            The histogram shows the distribution of overall risk scores assigned to the water samples. 
+            Peaks in this graph indicate the most common risk levels present in the dataset after preprocessing. 
+            A right-skewed plot would suggest many samples have low risk, while a more uniform or left-skewed shape would suggest higher risk is more prevalent.
+            """)
+        else:
+            st.warning("Risk_Score column not found or empty.")
+
+    elif selected_vis == vis_options[1]:
+        st.subheader("Risk Score vs MP Count per Liter")
+        if (
+            'Risk_Score' in df.columns
+            and 'MP_Count_per_L' in df.columns
+            and df['Risk_Score'].notna().sum() > 0
+            and df['MP_Count_per_L'].notna().sum() > 0
+        ):
+            fig, ax = plt.subplots()
+            ax.scatter(df['Risk_Score'], df['MP_Count_per_L'])
+            ax.set_xlabel("Risk Score")
+            ax.set_ylabel("MP Count per L")
+            st.pyplot(fig)
+            st.info("""
+            **Interpretation:**  
+            This scatter plot relates microplastic count per liter to the assigned risk score.
+            A positive correlation suggests that areas with higher microplastic concentrations tend to have higher calculated risk scores.
+            Outliers may represent samples where risk assessment doesn't strictly follow microplastic levels, possibly due to other environmental factors.
+            """)
+        else:
+            st.warning("Required columns not found or empty.")
+
+    elif selected_vis == vis_options[2]:
+        st.subheader("Risk Score by Risk Level")
+        if (
+            'Risk_Level' in df.columns
+            and 'Risk_Score' in df.columns
+            and df['Risk_Score'].notna().sum() > 0
+        ):
+            fig, ax = plt.subplots()
+            sns.boxplot(x=df['Risk_Level'], y=df['Risk_Score'], ax=ax)
+            st.pyplot(fig)
+            st.info("""
+            **Interpretation:**  
+            This boxplot visualizes how risk scores vary across different categorical risk levels.
+            It showcases the central tendency (median) and spread for each risk group.
+            If there is good separation between levels, it means the risk scoring system discriminates well between categories.
+            Overlaps or outliers may suggest inconsistencies or areas needing further analysis.
+            """)
+        else:
+            st.warning("Required columns not found or empty.")
