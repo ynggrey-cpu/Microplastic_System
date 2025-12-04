@@ -74,7 +74,6 @@ def load_data(uploaded_file=None, path: str = "Microplastic.csv"):
         raise last_err
     return None
 
-
 # -------------------------------------------------------
 # PREPROCESSING (original for EDA-style pages)
 # -------------------------------------------------------
@@ -94,7 +93,6 @@ def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 def cap_outliers_iqr(df: pd.DataFrame, cols) -> pd.DataFrame:
     df = df.copy()
     for col in cols:
@@ -110,7 +108,6 @@ def cap_outliers_iqr(df: pd.DataFrame, cols) -> pd.DataFrame:
         clipped = np.where(clipped > high, high, clipped)
         df[col] = clipped
     return df
-
 
 def transform_skewed(df: pd.DataFrame, cols):
     df = df.copy()
@@ -133,7 +130,6 @@ def transform_skewed(df: pd.DataFrame, cols):
 
     return df, skewness, skewed_cols
 
-
 def scale_numeric(df: pd.DataFrame, cols):
     df = df.copy()
     scaler = StandardScaler()
@@ -141,7 +137,6 @@ def scale_numeric(df: pd.DataFrame, cols):
     if cols_present:
         df[cols_present] = scaler.fit_transform(df[cols_present])
     return df, scaler
-
 
 def preprocess_for_model(df: pd.DataFrame):
     df = df.copy()
@@ -166,7 +161,6 @@ def preprocess_for_model(df: pd.DataFrame):
 
     return df, X, y_type, y_level, skewness, skewed_cols
 
-
 # -------------------------------------------------------
 # SPLIT HELPERS (STRATIFY FIX)
 # -------------------------------------------------------
@@ -176,7 +170,6 @@ def merge_rare_classes(y: pd.Series, min_count: int = 2, other_label: str = "Oth
     rare = counts[counts < min_count].index
     y = y.where(~y.isin(rare), other_label)
     return y
-
 
 def safe_train_test_split(X, y, test_size=0.2, random_state=42):
     y = pd.Series(y)
@@ -220,11 +213,11 @@ def safe_train_test_split(X, y, test_size=0.2, random_state=42):
     )
     return (X_train, X_test, y_train, y_test), False, float(test_size)
 
-
 # -------------------------------------------------------
-# MODELING
+# MODELING (cache results)
 # -------------------------------------------------------
-def train_models(X, y, test_size=0.2):
+@st.cache_resource
+def train_models_cached(X, y, test_size=0.2):
     y = pd.Series(y)
     mask = y.notna()
     X = X.loc[mask]
@@ -262,7 +255,7 @@ def train_models(X, y, test_size=0.2):
 
     models = {
         "Logistic Regression": LogisticRegression(max_iter=1000, multi_class="auto"),
-        "Random Forest": RandomForestClassifier(n_estimators=200, random_state=42),
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),  # Reduced for performance
         "Gradient Boosting": GradientBoostingClassifier(random_state=42),
     }
 
@@ -280,7 +273,6 @@ def train_models(X, y, test_size=0.2):
 
     metrics_df = pd.DataFrame(metrics_list).set_index("Model")
     return models, metrics_df, split_info, split_note, merge_note
-
 
 def smote_and_tune_logreg(X, y, test_size=0.2):
     y = pd.Series(y)
@@ -350,7 +342,6 @@ def smote_and_tune_logreg(X, y, test_size=0.2):
 
     return best_lr, tuned_metrics, grid.best_params_, split_info, split_note, merge_note, smote_used
 
-
 # -------------------------------------------------------
 # LEAKAGE-SAFE CV HELPERS (NEW PAGE)
 # -------------------------------------------------------
@@ -376,7 +367,6 @@ def build_preprocess_pipeline(df_raw: pd.DataFrame):
         remainder="drop"
     )
     return preprocessor
-
 
 def run_cross_validation(df_raw: pd.DataFrame, target_col: str, model_name: str,
                          n_splits: int = 5, stratified: bool = True, use_smote: bool = False):
@@ -443,7 +433,6 @@ def run_cross_validation(df_raw: pd.DataFrame, target_col: str, model_name: str,
 
     return summary_df, scores
 
-
 # -------------------------------------------------------
 # VISUALS
 # -------------------------------------------------------
@@ -463,7 +452,6 @@ def plot_hist_box(df, col):
     plt.tight_layout()
     return fig
 
-
 def plot_scatter(df, x_col, y_col):
     x = pd.to_numeric(df[x_col], errors="coerce")
     y = pd.to_numeric(df[y_col], errors="coerce")
@@ -480,7 +468,6 @@ def plot_scatter(df, x_col, y_col):
     plt.tight_layout()
     return fig
 
-
 def plot_metrics_bar(metrics_df, title_suffix=""):
     fig, ax = plt.subplots(figsize=(8, 5))
     metrics_df[["Accuracy", "Precision (weighted)", "Recall (weighted)", "F1-score (weighted)"]].plot(
@@ -491,7 +478,6 @@ def plot_metrics_bar(metrics_df, title_suffix=""):
     plt.xticks(rotation=0)
     plt.tight_layout()
     return fig
-
 
 def plot_box_by_category_readable(
     df,
@@ -536,7 +522,6 @@ def plot_box_by_category_readable(
     plt.tight_layout()
     return fig
 
-
 def plot_categorical_topn_bar(
     series: pd.Series,
     title: str,
@@ -567,7 +552,6 @@ def plot_categorical_topn_bar(
     ax.set_ylabel(series.name if series.name else "Category")
     plt.tight_layout()
     return fig, counts
-
 
 # -------------------------------------------------------
 # APP
@@ -830,78 +814,86 @@ def main():
                 st.warning("Risk_Type column not found; cannot train models for Risk-Type.")
             else:
                 st.subheader("Models for Risk-Type")
-                _, metrics_rt, split_info_rt, split_note_rt, merge_note_rt = train_models(X, y_type)
+                st.markdown("Run base classification models below. Cached for performance—output updates if input changes.")
+                if st.button("Run Models (Risk-Type)", key="run_models_rt"):
+                    with st.spinner("Training models... (cached for repeated runs)"):
+                        _, metrics_rt, split_info_rt, split_note_rt, merge_note_rt = train_models_cached(X, y_type)
+                    st.write("Performance Metrics – Risk-Type")
+                    st.dataframe(metrics_rt.style.format("{:.3f}"))
+                    st.pyplot(plot_metrics_bar(metrics_rt, "(Risk-Type)"))
+                    st.info(split_note_rt)
 
-                st.write("Performance Metrics – Risk-Type")
-                st.dataframe(metrics_rt.style.format("{:.3f}"))
-                st.pyplot(plot_metrics_bar(metrics_rt, "(Risk-Type)"))
-                st.info(split_note_rt)
+                    if merge_note_rt is not None:
+                        with st.expander("Rare-class merging details (small classes → 'Other')"):
+                            st.write("Before:")
+                            st.write(merge_note_rt["before"])
+                            st.write("After:")
+                            st.write(merge_note_rt["after"])
 
-                if merge_note_rt is not None:
-                    with st.expander("Rare-class merging details (small classes → 'Other')"):
-                        st.write("Before:")
-                        st.write(merge_note_rt["before"])
-                        st.write("After:")
-                        st.write(merge_note_rt["after"])
+                    st.markdown("**Train–Test Split (Risk-Type):**")
+                    st.markdown(
+                        f"""
+                        - Training set shape: `{split_info_rt['X_train_shape']}`  
+                        - Test set shape: `{split_info_rt['X_test_shape']}`
+                        """
+                    )
+                    st.write("Class distribution in **training set**:")
+                    st.write(split_info_rt["y_train_counts"])
+                    st.write("Class distribution in **test set**:")
+                    st.write(split_info_rt["y_test_counts"])
 
-                st.markdown("**Train–Test Split (Risk-Type):**")
-                st.markdown(
-                    f"""
-                    - Training set shape: `{split_info_rt['X_train_shape']}`  
-                    - Test set shape: `{split_info_rt['X_test_shape']}`
-                    """
-                )
-                st.write("Class distribution in **training set**:")
-                st.write(split_info_rt["y_train_counts"])
-                st.write("Class distribution in **test set**:")
-                st.write(split_info_rt["y_test_counts"])
-
-                st.markdown("**Interpretation:**")
-                st.markdown(
-                    """
-                    - Compare models using F1-score when classes are imbalanced.
-                    - Stratified split preserves proportions; rare-class merging improves stability.
-                    """
-                )
+                    st.markdown("**Interpretation:**")
+                    st.markdown(
+                        """
+                        - Compare models using F1-score when classes are imbalanced.
+                        - Stratified split preserves proportions; rare-class merging improves stability.
+                        """
+                    )
+                else:
+                    st.info("Click 'Run Models (Risk-Type)' to train & view results.")
 
         with tab2:
             if y_level is None:
                 st.warning("Risk_Level column not found; cannot train models for Risk-Level.")
             else:
                 st.subheader("Models for Risk-Level")
-                _, metrics_rl, split_info_rl, split_note_rl, merge_note_rl = train_models(X, y_level)
+                st.markdown("Run base classification models below. Cached for performance—output updates if input changes.")
+                if st.button("Run Models (Risk-Level)", key="run_models_rl"):
+                    with st.spinner("Training models... (cached for repeated runs)"):
+                        _, metrics_rl, split_info_rl, split_note_rl, merge_note_rl = train_models_cached(X, y_level)
+                    st.write("Performance Metrics – Risk-Level")
+                    st.dataframe(metrics_rl.style.format("{:.3f}"))
+                    st.pyplot(plot_metrics_bar(metrics_rl, "(Risk-Level)"))
+                    st.info(split_note_rl)
 
-                st.write("Performance Metrics – Risk-Level")
-                st.dataframe(metrics_rl.style.format("{:.3f}"))
-                st.pyplot(plot_metrics_bar(metrics_rl, "(Risk-Level)"))
-                st.info(split_note_rl)
+                    if merge_note_rl is not None:
+                        with st.expander("Rare-class merging details (small classes → 'Other')"):
+                            st.write("Before:")
+                            st.write(merge_note_rl["before"])
+                            st.write("After:")
+                            st.write(merge_note_rl["after"])
 
-                if merge_note_rl is not None:
-                    with st.expander("Rare-class merging details (small classes → 'Other')"):
-                        st.write("Before:")
-                        st.write(merge_note_rl["before"])
-                        st.write("After:")
-                        st.write(merge_note_rl["after"])
+                    st.markdown("**Train–Test Split (Risk-Level):**")
+                    st.markdown(
+                        f"""
+                        - Training set shape: `{split_info_rl['X_train_shape']}`  
+                        - Test set shape: `{split_info_rl['X_test_shape']}`
+                        """
+                    )
+                    st.write("Class distribution in **training set**:")
+                    st.write(split_info_rl["y_train_counts"])
+                    st.write("Class distribution in **test set**:")
+                    st.write(split_info_rl["y_test_counts"])
 
-                st.markdown("**Train–Test Split (Risk-Level):**")
-                st.markdown(
-                    f"""
-                    - Training set shape: `{split_info_rl['X_train_shape']}`  
-                    - Test set shape: `{split_info_rl['X_test_shape']}`
-                    """
-                )
-                st.write("Class distribution in **training set**:")
-                st.write(split_info_rl["y_train_counts"])
-                st.write("Class distribution in **test set**:")
-                st.write(split_info_rl["y_test_counts"])
-
-                st.markdown("**Interpretation:**")
-                st.markdown(
-                    """
-                    - Metrics evaluate the ability to classify Risk_Level categories.
-                    - Small classes may be merged into 'Other' to enable stable splitting.
-                    """
-                )
+                    st.markdown("**Interpretation:**")
+                    st.markdown(
+                        """
+                        - Metrics evaluate the ability to classify Risk_Level categories.
+                        - Small classes may be merged into 'Other' to enable stable splitting.
+                        """
+                    )
+                else:
+                    st.info("Click 'Run Models (Risk-Level)' to train & view results.")
 
         st.subheader("Overall Interpretation")
         st.markdown(
@@ -970,7 +962,7 @@ def main():
             st.subheader("Class Distribution of Risk-Type (Original)")
             st.write(pd.Series(y_type).value_counts())
 
-            _, base_metrics_rt, split_info_base_rt, split_note_base, merge_note_base = train_models(X, y_type)
+            _, base_metrics_rt, split_info_base_rt, split_note_base, merge_note_base = train_models_cached(X, y_type)
 
             st.subheader("Base Models Performance (Risk-Type)")
             st.dataframe(base_metrics_rt.style.format("{:.3f}"))
@@ -1017,7 +1009,7 @@ def main():
             st.dataframe(tuned_metrics.style.format("{:.3f}"))
 
             try:
-                _, base_metrics_compare, _, _, _ = train_models(X, y_type)
+                _, base_metrics_compare, _, _, _ = train_models_cached(X, y_type)
                 combined = pd.concat([base_metrics_compare, tuned_metrics])
                 st.subheader("Comparison: Tuned Logistic Regression vs Base Models")
                 st.dataframe(combined.style.format("{:.3f}"))
@@ -1089,7 +1081,6 @@ def main():
 
                 except Exception as e:
                     st.error(f"Cross-validation failed: {e}")
-
 
 if __name__ == "__main__":
     main()
